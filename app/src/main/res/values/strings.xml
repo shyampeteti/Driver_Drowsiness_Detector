@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DriveSafe</string>
+    <string name="title_audio_settings">Audio Alert Settings</string>
+    <string name="title_session_history">Driving Session History</string>
+</resources>

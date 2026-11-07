@@ -1,126 +1,345 @@
 package com.example.drowsiness.detection
 
-import java.util.ArrayDeque
 import kotlin.math.max
+import kotlin.math.min
 
-/** Pure Kotlin detection engine; timestamps are monotonic milliseconds. */
+/**
+ * Intelligent driver drowsiness detection coordinator.
+ *
+ * Combines independent eye tracking, duration-weighted closure classification,
+ * rolling PERCLOS calculation, modular yawning and head pose monitoring,
+ * and adaptive multi-indicator scoring.
+ */
 class DrowsinessDetector(
-    private val closedThreshold: Double = 0.20,
-    private val openThreshold: Double = 0.24,
-    private val prolongedClosureMs: Long = 1_500L,
-    private val observationGapResetMs: Long = 500L,
-    private val perclosWindowMs: Long = 30_000L,
-    private val minimumPerclosObservations: Int = 10,
-    private val perclosAlertThreshold: Double = 0.40,
-    private val alarmCooldownMs: Long = 5_000L
+    val initialClosedThreshold: Double = 0.20,
+    val initialOpenThreshold: Double = 0.24,
+    val observationGapResetMs: Long = 600L,
+    val warningCooldownMs: Long = 4_000L,
+    val criticalCooldownMs: Long = 2_500L
 ) {
-    private data class Sample(val timeMs: Long, val closed: Boolean)
-    private val samples = ArrayDeque<Sample>()
-    private var eyeState = EyeState.UNCERTAIN
+    // Sub-components
+    val calibrationManager = CalibrationManager(
+        defaultClosedThreshold = initialClosedThreshold,
+        defaultOpenThreshold = initialOpenThreshold
+    )
+    val episodeTracker = ClosureEpisodeTracker()
+    val perclosCalculator = PerclosCalculator()
+    val scoringEngine = DrowsinessScoringEngine()
+    val yawnTracker = YawnTracker()
+    val headPoseEstimator = HeadPoseEstimator()
+
+    // Operational State
     private var detectionState = DetectionState.STOPPED
-    private var closureStartMs: Long? = null
+    private var eyeState = EyeState.UNCERTAIN
+    private var smoothedEar: Double? = null
     private var lastValidObservationMs: Long? = null
-    private var lastAlarmMs: Long = Long.MIN_VALUE
-    private var lastEar: Double? = null
+    private var lastWarningAlertMs: Long = Long.MIN_VALUE
+    private var lastCriticalAlertMs: Long = Long.MIN_VALUE
 
-    init {
-        require(closedThreshold >= 0 && openThreshold > closedThreshold)
-        require(prolongedClosureMs > 0 && observationGapResetMs > 0 && perclosWindowMs > 0)
-        require(minimumPerclosObservations > 0 && perclosAlertThreshold in 0.0..1.0)
-    }
+    // Event Counters
+    var warningEventsCount: Int = 0
+        private set
+    var criticalEventsCount: Int = 0
+        private set
 
-    fun start(): DetectionSnapshot {
-        samples.clear()
-        eyeState = EyeState.UNCERTAIN
+    fun start(enableCalibration: Boolean = false, nowMs: Long = System.currentTimeMillis()): DetectionSnapshot {
+        resetInternalState()
         detectionState = DetectionState.MONITORING
-        closureStartMs = null
-        lastValidObservationMs = null
-        lastEar = null
-        lastAlarmMs = Long.MIN_VALUE
-        return snapshot(false, "Monitoring — looking for face")
+
+        if (enableCalibration) {
+            calibrationManager.startCalibration(nowMs)
+        }
+
+        return snapshot(
+            alarmRequested = false,
+            alertLevel = AlertLevel.NONE,
+            message = if (enableCalibration) "Calibrating baseline EAR… Please look ahead" else "Monitoring active — looking for driver face"
+        )
     }
 
+    /**
+     * Convenience overload for single combined EAR observations.
+     */
     fun observe(ear: Double?, timestampMs: Long, faceDetected: Boolean = true): DetectionSnapshot {
-        if (detectionState == DetectionState.STOPPED || detectionState == DetectionState.CAMERA_ERROR || detectionState == DetectionState.INITIALIZING) {
-            return snapshot(false, if (detectionState == DetectionState.CAMERA_ERROR) "Camera or model error" else "Monitoring stopped")
-        }
-        if (!faceDetected || ear == null || !ear.isFinite() || ear < 0.0) {
-            // An invalid frame breaks the continuous-closure interval; it is not evidence of closure.
-            prune(timestampMs)
-            closureStartMs = null
-            eyeState = EyeState.UNCERTAIN
-            detectionState = DetectionState.FACE_NOT_DETECTED
-            return snapshot(false, "Face not detected — adjust camera position")
+        return observe(
+            leftEar = ear,
+            rightEar = ear,
+            faceDetected = faceDetected,
+            mouthAspectRatio = null,
+            headPitchDegrees = null,
+            timestampMs = timestampMs
+        )
+    }
+
+    /**
+     * Process an observation frame.
+     *
+     * @param leftEar Left eye EAR (or null if unavailable)
+     * @param rightEar Right eye EAR (or null if unavailable)
+     * @param faceDetected Whether a face was detected in this frame
+     * @param mouthAspectRatio Calculated MAR for yawning detection
+     * @param headPitchDegrees Estimated pitch degrees for nodding detection
+     * @param timestampMs Monotonic timestamp in milliseconds
+     */
+    fun observe(
+        leftEar: Double?,
+        rightEar: Double?,
+        faceDetected: Boolean,
+        mouthAspectRatio: Double? = null,
+        headPitchDegrees: Double? = null,
+        timestampMs: Long
+    ): DetectionSnapshot {
+        if (detectionState == DetectionState.STOPPED ||
+            detectionState == DetectionState.CAMERA_ERROR ||
+            detectionState == DetectionState.INITIALIZING
+        ) {
+            return snapshot(
+                alarmRequested = false,
+                alertLevel = AlertLevel.NONE,
+                message = if (detectionState == DetectionState.CAMERA_ERROR) "Camera or model error" else "Monitoring stopped"
+            )
         }
 
-        val previousTime = lastValidObservationMs
-        if (previousTime != null && (timestampMs <= previousTime || timestampMs - previousTime > observationGapResetMs)) {
-            closureStartMs = null
-            if (detectionState == DetectionState.DROWSINESS_DETECTED) detectionState = DetectionState.MONITORING
+        // Handle missing face
+        if (!faceDetected || (leftEar == null && rightEar == null)) {
+            handleFaceLost(timestampMs)
+            return snapshot(
+                alarmRequested = false,
+                alertLevel = AlertLevel.NONE,
+                message = "Face not detected — ensure front camera has clear view"
+            )
+        }
+
+        // Check for observation time gap (e.g. app paused or frame dropped)
+        val prevTime = lastValidObservationMs
+        if (prevTime != null && (timestampMs <= prevTime || timestampMs - prevTime > observationGapResetMs)) {
+            smoothedEar = null
         }
         lastValidObservationMs = timestampMs
-        lastEar = ear
-        val wasDrowsy = detectionState == DetectionState.DROWSINESS_DETECTED
+
+        // Independent eye analysis & combined EAR
+        val validLeft = leftEar?.takeIf { it.isFinite() && it >= 0.0 }
+        val validRight = rightEar?.takeIf { it.isFinite() && it >= 0.0 }
+
+        val rawEar = when {
+            validLeft != null && validRight != null -> {
+                // If one eye is significantly closed while the other is open,
+                // prioritize the lower EAR to detect asymmetric closure/ptosis
+                val diff = kotlin.math.abs(validLeft - validRight)
+                if (diff > 0.08) min(validLeft, validRight) else (validLeft + validRight) / 2.0
+            }
+            validLeft != null -> validLeft
+            validRight != null -> validRight
+            else -> null
+        }
+
+        if (rawEar == null) {
+            handleFaceLost(timestampMs)
+            return snapshot(alarmRequested = false, alertLevel = AlertLevel.NONE, message = "Landmark tracking lost")
+        }
+
+        // Temporal smoothing (Exponential Moving Average)
+        val currentSmoothedEar = smoothedEar?.let { 0.65 * rawEar + 0.35 * it } ?: rawEar
+        smoothedEar = currentSmoothedEar
+
+        // Handle calibration if active
+        val calProgress = calibrationManager.processSample(currentSmoothedEar, timestampMs)
+        val closedThreshold = calibrationManager.closedThreshold
+        val openThreshold = calibrationManager.openThreshold
+
+        // Determine eye state with hysteresis
+        val prevEyeState = eyeState
         eyeState = when {
-            ear <= closedThreshold -> EyeState.CLOSED
-            ear >= openThreshold -> EyeState.OPEN
-            else -> eyeState.takeIf { it != EyeState.UNCERTAIN } ?: EyeState.UNCERTAIN
+            currentSmoothedEar <= closedThreshold -> EyeState.CLOSED
+            currentSmoothedEar >= openThreshold -> EyeState.OPEN
+            else -> if (prevEyeState != EyeState.UNCERTAIN) prevEyeState else EyeState.OPEN
         }
 
-        val closed = eyeState == EyeState.CLOSED
-        samples.addLast(Sample(timestampMs, closed))
-        prune(timestampMs)
-        if (closed) {
-            if (closureStartMs == null) closureStartMs = timestampMs
-        } else if (eyeState == EyeState.OPEN) {
-            closureStartMs = null
-            detectionState = DetectionState.MONITORING
+        val isClosed = eyeState == EyeState.CLOSED
+
+        // Update duration tracking and rolling episodes
+        val (closureDurationMs, _) = episodeTracker.update(isClosed, timestampMs)
+        perclosCalculator.recordObservation(timestampMs, isClosed)
+
+        // Update modular indicators
+        val yawnResult = yawnTracker.update(mouthAspectRatio, timestampMs)
+        val isHeadDown = headPitchDegrees != null && headPitchDegrees < -18.0
+
+        // Adaptive scoring
+        val prolongedCount = episodeTracker.countProlongedClosures(timestampMs)
+        val avgEpisodeDuration = episodeTracker.averageEpisodeDurationMs(timestampMs)
+        val rollingPerclos = perclosCalculator.calculate(timestampMs)
+
+        val scoreResult = scoringEngine.evaluate(
+            closureDurationMs = closureDurationMs,
+            perclos = rollingPerclos,
+            prolongedCount = prolongedCount,
+            avgEpisodeDurationMs = avgEpisodeDuration,
+            isYawning = yawnResult.isYawning,
+            isNodding = isHeadDown,
+            isEyeClosed = isClosed,
+            timestampMs = timestampMs
+        )
+
+        detectionState = scoreResult.state
+
+        // Determine Alert Escalation and Cooldowns
+        var alarmRequested = false
+        var alertLevel = AlertLevel.NONE
+
+        when (detectionState) {
+            DetectionState.CRITICAL -> {
+                alertLevel = AlertLevel.CRITICAL
+                // Critical alert can escalate immediately from warning or normal
+                val canTriggerCritical = lastCriticalAlertMs == Long.MIN_VALUE ||
+                        (timestampMs - lastCriticalAlertMs >= criticalCooldownMs)
+                if (canTriggerCritical) {
+                    alarmRequested = true
+                    lastCriticalAlertMs = timestampMs
+                    criticalEventsCount++
+                }
+            }
+            DetectionState.DROWSY -> {
+                alertLevel = AlertLevel.WARNING
+                val canTriggerWarning = lastWarningAlertMs == Long.MIN_VALUE ||
+                        (timestampMs - lastWarningAlertMs >= warningCooldownMs)
+                if (canTriggerWarning) {
+                    alarmRequested = true
+                    lastWarningAlertMs = timestampMs
+                    warningEventsCount++
+                }
+            }
+            else -> {
+                alertLevel = AlertLevel.NONE
+            }
         }
 
-        val closureDuration = closureStartMs?.let { max(0L, timestampMs - it) } ?: 0L
-        val perclos = calculatePerclos()
-        val prolonged = closed && closureDuration >= prolongedClosureMs
-        val perclosAlert = perclos != null && perclos >= perclosAlertThreshold && samples.size >= minimumPerclosObservations
-        val drowsy = prolonged || perclosAlert
-        detectionState = if (drowsy) DetectionState.DROWSINESS_DETECTED else DetectionState.MONITORING
-        val cooldownPassed = lastAlarmMs == Long.MIN_VALUE || timestampMs - lastAlarmMs >= alarmCooldownMs
-        val requestAlarm = drowsy && (!wasDrowsy || cooldownPassed)
-        if (requestAlarm) lastAlarmMs = timestampMs
-        return snapshot(requestAlarm, if (drowsy) "Drowsiness detected — take a break" else "Monitoring")
+        val durationCategory = DurationCategory.fromDuration(closureDurationMs)
+        val statusMessage = buildStatusMessage(detectionState, durationCategory, yawnResult.isYawning)
+
+        return snapshot(
+            alarmRequested = alarmRequested,
+            alertLevel = alertLevel,
+            message = statusMessage,
+            ear = currentSmoothedEar,
+            leftEar = validLeft,
+            rightEar = validRight,
+            closureDurationMs = closureDurationMs,
+            durationCategory = durationCategory,
+            perclos = rollingPerclos,
+            drowsinessScore = scoreResult.totalScore,
+            isYawning = yawnResult.isYawning,
+            mouthAspectRatio = mouthAspectRatio,
+            yawnCount = yawnTracker.totalYawnCount,
+            headPitchDegrees = headPitchDegrees,
+            isHeadNodding = isHeadDown,
+            isCalibrating = calibrationManager.isCalibrating,
+            calibrationProgressPercent = calProgress
+        )
     }
 
-    fun faceLost(timestampMs: Long): DetectionSnapshot = observe(null, timestampMs, faceDetected = false)
+    fun faceLost(timestampMs: Long): DetectionSnapshot {
+        handleFaceLost(timestampMs)
+        return snapshot(
+            alarmRequested = false,
+            alertLevel = AlertLevel.NONE,
+            message = "Face not detected — adjust device angle"
+        )
+    }
+
+    private fun handleFaceLost(timestampMs: Long) {
+        // Missing face is NOT counted as eye closure.
+        detectionState = DetectionState.FACE_NOT_DETECTED
+        eyeState = EyeState.UNCERTAIN
+        smoothedEar = null
+    }
+
+    fun startCalibration(timestampMs: Long) {
+        calibrationManager.startCalibration(timestampMs)
+    }
 
     fun fail(): DetectionSnapshot {
         detectionState = DetectionState.CAMERA_ERROR
         eyeState = EyeState.UNCERTAIN
-        closureStartMs = null
-        return snapshot(false, "Camera or model error")
+        smoothedEar = null
+        return snapshot(false, AlertLevel.NONE, "Camera or vision model error")
     }
 
     fun stop(): DetectionSnapshot {
         detectionState = DetectionState.STOPPED
+        resetInternalState()
+        return snapshot(false, AlertLevel.NONE, "Monitoring stopped")
+    }
+
+    private fun resetInternalState() {
         eyeState = EyeState.UNCERTAIN
-        closureStartMs = null
+        smoothedEar = null
         lastValidObservationMs = null
-        samples.clear()
-        return snapshot(false, "Monitoring stopped")
+        lastWarningAlertMs = Long.MIN_VALUE
+        lastCriticalAlertMs = Long.MIN_VALUE
+        episodeTracker.reset()
+        perclosCalculator.reset()
+        scoringEngine.reset()
+        yawnTracker.reset()
+        headPoseEstimator.reset()
     }
 
-    private fun prune(nowMs: Long) {
-        while (samples.isNotEmpty() && nowMs - samples.first.timeMs > perclosWindowMs) samples.removeFirst()
+    private fun buildStatusMessage(
+        state: DetectionState,
+        durationCategory: DurationCategory,
+        isYawning: Boolean
+    ): String = when (state) {
+        DetectionState.CRITICAL -> "CRITICAL: Possible driver drowsiness. Stop safely and take a break."
+        DetectionState.DROWSY -> if (isYawning) "Signs of drowsiness detected (Yawning). Stay alert." else "Signs of drowsiness detected."
+        DetectionState.FACE_NOT_DETECTED -> "Face not detected — adjust camera position"
+        DetectionState.INITIALIZING -> "Initializing vision system…"
+        DetectionState.CAMERA_ERROR -> "Camera or vision error"
+        DetectionState.STOPPED -> "Monitoring stopped"
+        DetectionState.MONITORING -> when (durationCategory) {
+            DurationCategory.MONITOR -> "Eye closure monitored"
+            else -> "Driver attentive — system active"
+        }
     }
 
-    private fun calculatePerclos(): Double? {
-        if (samples.size < minimumPerclosObservations) return null
-        val valid = samples.count { it.closed || !it.closed }
-        if (valid < minimumPerclosObservations) return null
-        return samples.count { it.closed }.toDouble() / valid
-    }
-
-    private fun snapshot(alarm: Boolean, message: String): DetectionSnapshot {
-        val now = lastValidObservationMs
-        val duration = if (now != null && closureStartMs != null) max(0L, now - closureStartMs!!) else 0L
-        return DetectionSnapshot(detectionState, eyeState, lastEar, duration, calculatePerclos(), alarm, message)
-    }
+    private fun snapshot(
+        alarmRequested: Boolean,
+        alertLevel: AlertLevel,
+        message: String,
+        ear: Double? = smoothedEar,
+        leftEar: Double? = null,
+        rightEar: Double? = null,
+        closureDurationMs: Long = 0L,
+        durationCategory: DurationCategory = DurationCategory.NORMAL_BLINK,
+        perclos: Double? = null,
+        drowsinessScore: Double = 0.0,
+        isYawning: Boolean = false,
+        mouthAspectRatio: Double? = null,
+        yawnCount: Int = yawnTracker.totalYawnCount,
+        headPitchDegrees: Double? = null,
+        isHeadNodding: Boolean = false,
+        isCalibrating: Boolean = calibrationManager.isCalibrating,
+        calibrationProgressPercent: Int = 100
+    ): DetectionSnapshot = DetectionSnapshot(
+        state = detectionState,
+        eyeState = eyeState,
+        ear = ear,
+        leftEar = leftEar,
+        rightEar = rightEar,
+        closureDurationMs = closureDurationMs,
+        durationCategory = durationCategory,
+        perclos = perclos,
+        drowsinessScore = drowsinessScore,
+        alertLevel = alertLevel,
+        alarmRequested = alarmRequested,
+        statusMessage = message,
+        warningEventsCount = warningEventsCount,
+        criticalEventsCount = criticalEventsCount,
+        isYawning = isYawning,
+        mouthAspectRatio = mouthAspectRatio,
+        yawnCount = yawnCount,
+        headPitchDegrees = headPitchDegrees,
+        isHeadNodding = isHeadNodding,
+        isCalibrating = isCalibrating,
+        calibrationProgressPercent = calibrationProgressPercent
+    )
 }
