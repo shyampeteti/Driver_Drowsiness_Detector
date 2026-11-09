@@ -36,4 +36,7 @@ dependencies {
     implementation("androidx.camera:camera-view:1.4.1")
     implementation("com.google.mediapipe:tasks-vision:0.10.21")
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

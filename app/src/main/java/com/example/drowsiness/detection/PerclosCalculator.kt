@@ -20,7 +20,7 @@ class PerclosCalculator(
      * Each sample records the timestamp and eye closure state at that point.
      * PERCLOS is computed as the fraction of *time* (not frames) the eyes were closed.
      */
-    data class ObservationSample(val timeMs: Long, val isClosed: Boolean)
+    data class ObservationSample(val timeMs: Long, val isClosed: Boolean, val connectsToNext: Boolean = true)
 
     private val samples = ArrayDeque<ObservationSample>()
 
@@ -29,8 +29,14 @@ class PerclosCalculator(
      * Do NOT call this when face is missing or state is UNCERTAIN.
      */
     fun recordObservation(timestampMs: Long, isClosed: Boolean) {
-        samples.addLast(ObservationSample(timestampMs, isClosed))
+        samples.addLast(ObservationSample(timestampMs, isClosed, connectsToNext = true))
         prune(timestampMs)
+    }
+
+    /** Break the interval across an unobserved period while retaining prior valid history. */
+    fun breakContinuity() {
+        val last = samples.pollLast() ?: return
+        samples.addLast(last.copy(connectsToNext = false))
     }
 
     /**
@@ -51,13 +57,13 @@ class PerclosCalculator(
         for (i in 0 until list.size - 1) {
             val current = list[i]
             val next = list[i + 1]
+            if (!current.connectsToNext) continue
             val intervalMs = next.timeMs - current.timeMs
-            // Clamp unreasonably large gaps or negative intervals
-            val clampedIntervalMs = intervalMs.coerceIn(0L, maxIntervalMs)
-            if (clampedIntervalMs > 0) {
-                totalTimeMs += clampedIntervalMs
+            // A large gap is unknown time, not a shorter valid interval.
+            if (intervalMs in 1L..maxIntervalMs) {
+                totalTimeMs += intervalMs
                 if (current.isClosed) {
-                    closedTimeMs += clampedIntervalMs
+                    closedTimeMs += intervalMs
                 }
             }
         }

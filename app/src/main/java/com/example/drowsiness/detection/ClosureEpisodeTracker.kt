@@ -129,4 +129,18 @@ class ClosureEpisodeTracker(
         longestClosureMs = 0L
         episodesHistory.clear()
     }
+
+    /** Ends an in-progress episode at its last observed closed frame, retaining completed history. */
+    fun suspendAtLastObservation(): ClosureEpisode? {
+        val start = closureStartMs ?: return null
+        val end = lastClosedObservationMs ?: start
+        val duration = max(0L, end - start)
+        val episode = if (duration > 0L) ClosureEpisode(start, end, duration, DurationCategory.fromDuration(duration)) else null
+        if (episode != null) episodesHistory.addLast(episode)
+        closureStartMs = null
+        lastClosedObservationMs = null
+        firstOpenObservationMs = null
+        currentDurationMs = 0L
+        return episode
+    }
 }

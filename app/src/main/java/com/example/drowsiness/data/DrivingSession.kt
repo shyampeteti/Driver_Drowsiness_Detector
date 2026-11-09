@@ -17,12 +17,19 @@ data class DrivingSession(
     val warningEventsCount: Int,
     val criticalEventsCount: Int,
     val longestClosureMs: Long,
-    val averagePerclos: Double,
+    /** Legacy stored PERCLOS field; older values are preserved but not presented as time-weighted averages. */
+    val averagePerclos: Double?,
     val timeNormalMs: Long,
     val timeWarningMs: Long,
     val timeCriticalMs: Long,
     val timeFaceLostMs: Long,
-    val yawnCount: Int = 0
+    val yawnCount: Int = 0,
+    val nodCount: Int? = null,
+    /** Null for rows saved before activation-based drowsiness incident tracking existed. */
+    val criticalDrowsinessIncidentCount: Int? = null,
+    val criticalFaceLossIncidentCount: Int? = null,
+    val terminationReason: String? = null,
+    val timeWeightedAveragePerclos: Double? = null
 ) {
     val formattedDate: String
         get() {

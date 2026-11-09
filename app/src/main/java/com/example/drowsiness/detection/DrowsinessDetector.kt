@@ -23,7 +23,7 @@ class DrowsinessDetector(
     val initialOpenThreshold: Double = 0.22,
     val observationGapResetMs: Long = 600L,
     val warningCooldownMs: Long = 4_000L,
-    val criticalCooldownMs: Long = 2_500L,
+    val criticalCooldownMs: Long = 5_000L,
     val earEmaAlpha: Double = 0.50,
     val enableAdaptiveBaseline: Boolean = true
 ) {
@@ -36,8 +36,8 @@ class DrowsinessDetector(
     val perclosCalculator = PerclosCalculator()
     val scoringEngine = DrowsinessScoringEngine()
     val yawnTracker = YawnTracker()
-    val headPoseEstimator = HeadPoseEstimator()
     val adaptiveBaselineTracker = AdaptiveBaselineTracker(enabled = enableAdaptiveBaseline)
+    val faceVisibilityTracker = FaceVisibilityTracker(maxObservationGapMs = observationGapResetMs)
 
     // Operational State
     private var detectionState = DetectionState.STOPPED
@@ -52,6 +52,16 @@ class DrowsinessDetector(
     private var lastValidObservationMs: Long? = null
     private var lastWarningAlertMs: Long = Long.MIN_VALUE
     private var lastCriticalAlertMs: Long = Long.MIN_VALUE
+    private var drowsinessCriticalActive = false
+    private var lastObservedNodCount = 0
+    private var lastSessionPerclos: Double? = null
+    private var lastSessionPerclosTimestampMs: Long? = null
+    private var sessionPerclosIntegral = 0.0
+    private var sessionPerclosWeightMs = 0L
+
+    val nodEventCount: Int get() = lastObservedNodCount
+    val timeWeightedAveragePerclos: Double?
+        get() = sessionPerclosWeightMs.takeIf { it > 0L }?.let { sessionPerclosIntegral / it }
 
     /**
      * Last completed closure duration in ms.
@@ -63,6 +73,8 @@ class DrowsinessDetector(
     var warningEventsCount: Int = 0
         private set
     var criticalEventsCount: Int = 0
+        private set
+    var criticalDrowsinessIncidentCount: Int = 0
         private set
 
     fun start(enableCalibration: Boolean = false, nowMs: Long = System.currentTimeMillis()): DetectionSnapshot {
@@ -115,6 +127,7 @@ class DrowsinessDetector(
         mouthAspectRatio: Double? = null,
         mouthMetrics: MouthAspectRatioCalculator.MouthMetrics? = null,
         headPitchDegrees: Double? = null,
+        nodEventCount: Int = 0,
         timestampMs: Long
     ): DetectionSnapshot {
         if (detectionState == DetectionState.STOPPED ||
@@ -128,22 +141,47 @@ class DrowsinessDetector(
             )
         }
 
-        // Handle missing face or complete landmark loss
-        if (!faceDetected || (leftEar == null && rightEar == null)) {
+        val visibility = faceVisibilityTracker.observe(faceDetected, timestampMs)
+        lastObservedNodCount = nodEventCount
+        if (!faceDetected) {
             handleFaceLost(timestampMs)
+            return faceSnapshot(visibility, timestampMs)
+        }
+        if (visibility.isReacquiring && !visibility.faceLossRecovered) {
+            return faceSnapshot(visibility, timestampMs)
+        }
+        if (visibility.faceLossRecovered) {
+            suspendClosureAtLastObservation()
+            scoringEngine.suspendRecovery()
+            resetEyeSmoothing()
+        }
+        if (leftEar == null && rightEar == null) {
+            handleEyeMeasurementsUnavailable()
             return snapshot(
-                alarmRequested = false,
-                alertLevel = AlertLevel.NONE,
-                message = "Face not detected — ensure front camera has clear view"
+                alarmRequested = requestCriticalPlaybackIfEligible(timestampMs, visibility.isFaceLossCritical || drowsinessCriticalActive),
+                alertLevel = currentAlertLevel(visibility.isFaceLossCritical),
+                message = if (visibility.isFaceLossCritical) FACE_LOSS_WARNING else "Face visible — eye measurements unavailable",
+                ear = null,
+                leftEar = null,
+                rightEar = null,
+                perclos = null,
+                faceLossCritical = visibility.isFaceLossCritical,
+                faceLossIncidentCount = visibility.faceLossIncidentCount,
+                alertActive = visibility.isFaceLossCritical || drowsinessCriticalActive,
+                faceVisible = true,
+                faceLocked = visibility.isFaceLocked,
+                drowsinessCritical = drowsinessCriticalActive
             )
         }
-
         // Check for observation time gap (app paused, camera frame drop, reconnection)
         val prevTime = lastValidObservationMs
         if (prevTime != null && (timestampMs <= prevTime || timestampMs - prevTime > observationGapResetMs)) {
             smoothedLeftEar = null
             smoothedRightEar = null
             smoothedEar = null
+            suspendClosureAtLastObservation()
+            scoringEngine.suspendRecovery()
+            perclosCalculator.breakContinuity()
         }
         lastValidObservationMs = timestampMs
 
@@ -298,10 +336,15 @@ class DrowsinessDetector(
             isEyeClosed = isBilateralClosed,
             timestampMs = timestampMs,
             yawnEventCount = yawnTracker.totalYawnCount,
-            nodEventCount = headPoseEstimator.totalNodCount
+            nodEventCount = nodEventCount
         )
 
+        val wasDrowsinessCritical = drowsinessCriticalActive
         detectionState = scoreResult.state
+        drowsinessCriticalActive = detectionState == DetectionState.CRITICAL
+        if (!wasDrowsinessCritical && drowsinessCriticalActive) criticalDrowsinessIncidentCount++
+
+        if (rollingPerclos != null) recordSessionPerclos(timestampMs, rollingPerclos)
 
         // Optional slow adaptive baseline update (Section 9)
         if (calibrationManager.calibrationSucceeded) {
@@ -326,13 +369,8 @@ class DrowsinessDetector(
         when (detectionState) {
             DetectionState.CRITICAL -> {
                 alertLevel = AlertLevel.CRITICAL
-                val canTriggerCritical = lastCriticalAlertMs == Long.MIN_VALUE ||
-                        (timestampMs - lastCriticalAlertMs >= criticalCooldownMs)
-                if (canTriggerCritical) {
-                    alarmRequested = true
-                    lastCriticalAlertMs = timestampMs
-                    criticalEventsCount++
-                }
+                alarmRequested = requestCriticalPlaybackIfEligible(timestampMs, true)
+                if (alarmRequested) criticalEventsCount++
             }
             DetectionState.DROWSY -> {
                 alertLevel = AlertLevel.WARNING
@@ -355,7 +393,7 @@ class DrowsinessDetector(
 
         return snapshot(
             alarmRequested = alarmRequested,
-            alertLevel = alertLevel,
+            alertLevel = if (visibility.isFaceLossCritical) AlertLevel.CRITICAL else alertLevel,
             message = statusMessage,
             ear = smoothedEar,
             leftEar = leftResult.smoothedEar ?: leftEar,
@@ -375,17 +413,80 @@ class DrowsinessDetector(
             rightEyeState = rightEyeState,
             baselineLeftEar = adaptiveBaselineTracker.currentBaselineLeft ?: calibrationManager.baselineOpenEarLeft,
             baselineRightEar = adaptiveBaselineTracker.currentBaselineRight ?: calibrationManager.baselineOpenEarRight,
-            calibrationFailureReason = calibrationManager.failureReason
+            calibrationFailureReason = calibrationManager.failureReason,
+            faceLossCritical = visibility.isFaceLossCritical,
+            faceLossIncidentCount = visibility.faceLossIncidentCount,
+            alertActive = visibility.isFaceLossCritical || detectionState == DetectionState.DROWSY || detectionState == DetectionState.CRITICAL,
+            faceVisible = true,
+            faceLocked = visibility.isFaceLocked,
+            drowsinessCritical = drowsinessCriticalActive
         )
     }
 
     fun faceLost(timestampMs: Long): DetectionSnapshot {
+        val visibility = faceVisibilityTracker.observe(false, timestampMs)
         handleFaceLost(timestampMs)
-        return snapshot(
-            alarmRequested = false,
-            alertLevel = AlertLevel.NONE,
-            message = "Face not detected — adjust device angle"
-        )
+        return faceSnapshot(visibility, timestampMs)
+    }
+
+    private fun faceSnapshot(v: FaceVisibilityTracker.Result, timestampMs: Long) = snapshot(
+        alarmRequested = requestCriticalPlaybackIfEligible(timestampMs, v.isFaceLossCritical || drowsinessCriticalActive),
+        alertLevel = currentAlertLevel(v.isFaceLossCritical),
+        message = when {
+            v.isFaceLossCritical -> FACE_LOSS_WARNING
+            v.isFaceVisible -> "Face found — confirming stable reacquisition"
+            else -> "Face not detected — waiting for stable reacquisition"
+        },
+        faceLossCritical = v.isFaceLossCritical,
+        faceLossIncidentCount = v.faceLossIncidentCount,
+        alertActive = v.isFaceLossCritical || drowsinessCriticalActive || detectionState == DetectionState.DROWSY,
+        faceVisible = v.isFaceVisible,
+        faceLocked = v.isFaceLocked,
+        drowsinessCritical = drowsinessCriticalActive
+    )
+
+    private fun currentAlertLevel(faceLossCritical: Boolean): AlertLevel = when {
+        faceLossCritical || drowsinessCriticalActive -> AlertLevel.CRITICAL
+        detectionState == DetectionState.DROWSY -> AlertLevel.WARNING
+        else -> AlertLevel.NONE
+    }
+
+    private fun requestCriticalPlaybackIfEligible(timestampMs: Long, conditionActive: Boolean): Boolean {
+        if (!conditionActive) return false
+        val eligible = lastCriticalAlertMs == Long.MIN_VALUE || timestampMs - lastCriticalAlertMs >= criticalCooldownMs
+        if (eligible) lastCriticalAlertMs = timestampMs
+        return eligible
+    }
+
+    private fun recordSessionPerclos(timestampMs: Long, value: Double) {
+        val previousTime = lastSessionPerclosTimestampMs
+        val previousValue = lastSessionPerclos
+        if (previousTime != null && previousValue != null) {
+            val interval = timestampMs - previousTime
+            if (interval in 1L..observationGapResetMs) {
+                sessionPerclosIntegral += (previousValue + value) / 2.0 * interval
+                sessionPerclosWeightMs += interval
+            }
+        }
+        lastSessionPerclos = value
+        lastSessionPerclosTimestampMs = timestampMs
+    }
+
+    private fun handleEyeMeasurementsUnavailable() {
+        if (lastValidObservationMs != null) {
+            suspendClosureAtLastObservation()
+            scoringEngine.suspendRecovery()
+        }
+        perclosCalculator.breakContinuity()
+        lastValidObservationMs = null
+        lastSessionPerclos = null
+        lastSessionPerclosTimestampMs = null
+        resetEyeSmoothing()
+    }
+
+    private fun resetEyeSmoothing() {
+        smoothedLeftEar = null; smoothedRightEar = null; smoothedEar = null
+        eyeState = EyeState.UNCERTAIN; leftEyeState = EyeState.UNCERTAIN; rightEyeState = EyeState.UNCERTAIN
     }
 
     private fun handleFaceLost(timestampMs: Long) {
@@ -397,6 +498,14 @@ class DrowsinessDetector(
         smoothedLeftEar = null
         smoothedRightEar = null
         smoothedEar = null
+        if (lastValidObservationMs != null) {
+            suspendClosureAtLastObservation()
+            scoringEngine.suspendRecovery()
+        }
+        perclosCalculator.breakContinuity()
+        lastValidObservationMs = null
+        lastSessionPerclos = null
+        lastSessionPerclosTimestampMs = null
     }
 
     fun startCalibration(timestampMs: Long) {
@@ -406,16 +515,18 @@ class DrowsinessDetector(
 
     fun fail(): DetectionSnapshot {
         detectionState = DetectionState.CAMERA_ERROR
+        drowsinessCriticalActive = false
         eyeState = EyeState.UNCERTAIN
         leftEyeState = EyeState.UNCERTAIN
         rightEyeState = EyeState.UNCERTAIN
         smoothedLeftEar = null
         smoothedRightEar = null
         smoothedEar = null
-        return snapshot(false, AlertLevel.NONE, "Camera or vision model error")
+        return snapshot(false, AlertLevel.NONE, "Camera or vision model error", drowsinessCritical = false, alertActive = false)
     }
 
     fun stop(): DetectionSnapshot {
+        suspendClosureAtLastObservation()
         detectionState = DetectionState.STOPPED
         resetInternalState()
         return snapshot(false, AlertLevel.NONE, "Monitoring stopped")
@@ -437,14 +548,27 @@ class DrowsinessDetector(
         scoringEngine.reset()
     }
 
+    private fun suspendClosureAtLastObservation() {
+        episodeTracker.suspendAtLastObservation()?.let { episode ->
+            lastCompletedClosureDurationMs = max(lastCompletedClosureDurationMs, episode.durationMs)
+        }
+    }
+
     private fun resetInternalState() {
         resetMonitoringState()
         calibrationManager.reset()
         adaptiveBaselineTracker.reset()
         yawnTracker.reset()
-        headPoseEstimator.reset()
         warningEventsCount = 0
         criticalEventsCount = 0
+        criticalDrowsinessIncidentCount = 0
+        faceVisibilityTracker.reset()
+        drowsinessCriticalActive = false
+        lastObservedNodCount = 0
+        lastSessionPerclos = null
+        lastSessionPerclosTimestampMs = null
+        sessionPerclosIntegral = 0.0
+        sessionPerclosWeightMs = 0L
     }
 
     private fun buildStatusMessage(
@@ -463,6 +587,10 @@ class DrowsinessDetector(
             DurationCategory.MONITOR -> "Eye closure monitored"
             else -> "Driver attentive — system active"
         }
+    }
+
+    companion object {
+        const val FACE_LOSS_WARNING = "CRITICAL — DRIVER FACE NOT VISIBLE. CHECK DRIVER AND CAMERA."
     }
 
     private fun snapshot(
@@ -487,7 +615,14 @@ class DrowsinessDetector(
         rightEyeState: EyeState = this.rightEyeState,
         baselineLeftEar: Double? = calibrationManager.baselineOpenEarLeft,
         baselineRightEar: Double? = calibrationManager.baselineOpenEarRight,
-        calibrationFailureReason: CalibrationFailureReason = calibrationManager.failureReason
+        calibrationFailureReason: CalibrationFailureReason = calibrationManager.failureReason,
+        faceLossCritical: Boolean = false,
+        faceLossIncidentCount: Int = faceVisibilityTracker.faceLossIncidentCount,
+        alertActive: Boolean = detectionState == DetectionState.DROWSY || detectionState == DetectionState.CRITICAL,
+        faceVisible: Boolean = faceVisibilityTracker.isFaceVisible,
+        drowsinessCritical: Boolean = drowsinessCriticalActive,
+        faceLocked: Boolean = faceVisibilityTracker.isFaceLocked,
+        criticalDrowsinessIncidentCount: Int = this.criticalDrowsinessIncidentCount
     ): DetectionSnapshot = DetectionSnapshot(
         state = detectionState,
         eyeState = eyeState,
@@ -514,6 +649,14 @@ class DrowsinessDetector(
         rightEyeState = rightEyeState,
         baselineLeftEar = baselineLeftEar,
         baselineRightEar = baselineRightEar,
-        calibrationFailureReason = calibrationFailureReason
+        calibrationFailureReason = calibrationFailureReason,
+        faceLossCritical = faceLossCritical,
+        faceLossIncidentCount = faceLossIncidentCount,
+        alertActive = alertActive,
+        faceVisible = faceVisible,
+        drowsinessCritical = drowsinessCritical,
+        faceLocked = faceLocked,
+        criticalDrowsinessIncidentCount = criticalDrowsinessIncidentCount
     )
+
 }

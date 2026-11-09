@@ -9,8 +9,20 @@ import org.junit.Test
 class PerclosCalculatorTest {
 
     @Test
+    fun unknownIntervalsAreExcludedAfterContinuityBreak() {
+        val calculator = PerclosCalculator(windowMs = 10_000L, minimumValidObservationMs = 100L, maxIntervalMs = 500L)
+        calculator.recordObservation(0L, isClosed = true)
+        calculator.recordObservation(200L, isClosed = true)
+        calculator.breakContinuity()
+        calculator.recordObservation(5_000L, isClosed = false)
+        calculator.recordObservation(5_200L, isClosed = false)
+
+        assertEquals(0.5, calculator.calculate(5_200L)!!, 0.001)
+    }
+
+    @Test
     fun returnsNullBeforeMinimumWindowFills() {
-        val calc = PerclosCalculator(minimumValidObservationMs = 5_000L)
+        val calc = PerclosCalculator(minimumValidObservationMs = 5_000L, maxIntervalMs = 1_000L)
         calc.recordObservation(0L, false)
         calc.recordObservation(1_000L, false)
         // Only 1 second of observations — below the 5-second minimum
@@ -43,7 +55,7 @@ class PerclosCalculatorTest {
     @Test
     fun halfPerclosWhenHalfTimeIsClosed() {
         // 10 seconds of data: alternating 1-second closed, 1-second open
-        val calc = PerclosCalculator(minimumValidObservationMs = 5_000L)
+        val calc = PerclosCalculator(minimumValidObservationMs = 5_000L, maxIntervalMs = 1_000L)
         for (i in 0..10) {
             val t = i * 1_000L
             calc.recordObservation(t, isClosed = (i % 2 == 0))

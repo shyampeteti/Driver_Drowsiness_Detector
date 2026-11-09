@@ -42,13 +42,17 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
         val rightEar: Double?,
         val mouthAspectRatio: Double? = null,
         val mouthMetrics: MouthAspectRatioCalculator.MouthMetrics? = null,
-        val headPitchDegrees: Double? = null
+        val headPitchDegrees: Double? = null,
+        val nodEventCount: Int = 0
     )
 
     fun detect(bitmap: Bitmap, timestampMs: Long): Observation {
         val mpImage = BitmapImageBuilder(bitmap).build()
         val result: FaceLandmarkerResult = landmarker.detectForVideo(mpImage, timestampMs)
-        val face = result.faceLandmarks().firstOrNull() ?: return Observation(null, false, null, null)
+        val face = result.faceLandmarks().firstOrNull() ?: run {
+            poseEstimator.suspendTracking()
+            return Observation(null, false, null, null, nodEventCount = poseEstimator.totalNodCount)
+        }
 
         val w = bitmap.width
         val h = bitmap.height
@@ -77,7 +81,8 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
             rightEar = right,
             mouthAspectRatio = mar,
             mouthMetrics = mouthMetrics,
-            headPitchDegrees = pitch
+            headPitchDegrees = pitch,
+            nodEventCount = poseEstimator.totalNodCount
         )
     }
 
@@ -124,7 +129,10 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
         height: Int,
         timestampMs: Long
     ): Double? {
-        if (HeadPoseEstimator.POSE_INDICES.any { it !in landmarks.indices }) return null
+        if (HeadPoseEstimator.POSE_INDICES.any { it !in landmarks.indices }) {
+            poseEstimator.suspendTracking()
+            return null
+        }
 
         fun pt(index: Int): Point2D {
             val p = landmarks[index]

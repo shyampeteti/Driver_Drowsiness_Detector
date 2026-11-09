@@ -1,52 +1,56 @@
 package com.example.drowsiness.camera
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
-import android.graphics.Rect
-import android.graphics.YuvImage
 import androidx.camera.core.ImageProxy
-import java.io.ByteArrayOutputStream
 
-/** Simple compatibility-first YUV_420_888 -> Bitmap converter for prototype frame rates. */
+/** Direct YUV_420_888 to RGB conversion, avoiding NV21, JPEG, and JPEG decode intermediates. */
 object YuvBitmapConverter {
+    private var scratchPixels = IntArray(0)
+    private var scratchWidth = 0
+    private var scratchHeight = 0
+
+    @Synchronized
     fun convert(image: ImageProxy): Bitmap? {
-        val y = image.planes.getOrNull(0) ?: return null
-        val u = image.planes.getOrNull(1) ?: return null
-        val v = image.planes.getOrNull(2) ?: return null
+        val yPlane = image.planes.getOrNull(0) ?: return null
+        val uPlane = image.planes.getOrNull(1) ?: return null
+        val vPlane = image.planes.getOrNull(2) ?: return null
         val width = image.width
         val height = image.height
-        val nv21 = ByteArray(width * height + width * height / 2)
-        copyPlane(y, width, height, nv21, 0, 1)
-        // NV21 chroma order is V then U.
-        var offset = width * height
-        val rowStride = v.rowStride
-        val pixelStride = v.pixelStride
-        for (row in 0 until height / 2) {
-            for (col in 0 until width / 2) {
-                val vi = row * rowStride + col * pixelStride
-                val ui = row * u.rowStride + col * u.pixelStride
-                if (offset + 1 < nv21.size && vi < v.buffer.limit() && ui < u.buffer.limit()) {
-                    nv21[offset++] = v.buffer.get(vi)
-                    nv21[offset++] = u.buffer.get(ui)
-                }
+        if (width <= 0 || height <= 0) return null
+        val pixelCount = width * height
+        if (scratchWidth != width || scratchHeight != height || scratchPixels.size != pixelCount) {
+            scratchPixels = IntArray(pixelCount)
+            scratchWidth = width
+            scratchHeight = height
+        }
+
+        val yBuffer = yPlane.buffer.duplicate()
+        val uBuffer = uPlane.buffer.duplicate()
+        val vBuffer = vPlane.buffer.duplicate()
+        val chromaWidth = (width + 1) / 2
+        val chromaHeight = (height + 1) / 2
+        for (row in 0 until height) {
+            val chromaRow = (row / 2).coerceAtMost(chromaHeight - 1)
+            for (col in 0 until width) {
+                val yIndex = row * yPlane.rowStride + col * yPlane.pixelStride
+                val chromaCol = (col / 2).coerceAtMost(chromaWidth - 1)
+                val uIndex = chromaRow * uPlane.rowStride + chromaCol * uPlane.pixelStride
+                val vIndex = chromaRow * vPlane.rowStride + chromaCol * vPlane.pixelStride
+                if (yIndex !in 0 until yBuffer.limit() || uIndex !in 0 until uBuffer.limit() || vIndex !in 0 until vBuffer.limit()) return null
+
+                val y = (yBuffer.get(yIndex).toInt() and 0xff) - 16
+                val u = (uBuffer.get(uIndex).toInt() and 0xff) - 128
+                val v = (vBuffer.get(vIndex).toInt() and 0xff) - 128
+                val c = y.coerceAtLeast(0)
+                val red = ((298 * c + 409 * v + 128) shr 8).coerceIn(0, 255)
+                val green = ((298 * c - 100 * u - 208 * v + 128) shr 8).coerceIn(0, 255)
+                val blue = ((298 * c + 516 * u + 128) shr 8).coerceIn(0, 255)
+                scratchPixels[row * width + col] = (0xff shl 24) or (red shl 16) or (green shl 8) or blue
             }
         }
-        val yuv = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        val out = ByteArrayOutputStream()
-        if (!yuv.compressToJpeg(Rect(0, 0, width, height), 85, out)) return null
-        return BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
-    }
 
-    private fun copyPlane(plane: ImageProxy.PlaneProxy, width: Int, height: Int, out: ByteArray, outOffset: Int, outPixelStride: Int) {
-        val buffer = plane.buffer
-        var offset = outOffset
-        for (row in 0 until height) {
-            for (col in 0 until width) {
-                val index = row * plane.rowStride + col * plane.pixelStride
-                if (index < buffer.limit() && offset < out.size) out[offset] = buffer.get(index)
-                offset += outPixelStride
-            }
+        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+            it.setPixels(scratchPixels, 0, width, 0, 0, width, height)
         }
     }
 }

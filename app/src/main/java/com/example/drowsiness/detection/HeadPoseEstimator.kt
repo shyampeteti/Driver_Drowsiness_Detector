@@ -27,6 +27,7 @@ class HeadPoseEstimator(
     }
 
     private var nodStartMs: Long? = null
+    private var lastObservationMs: Long? = null
     var totalNodCount: Int = 0
         private set
 
@@ -49,10 +50,17 @@ class HeadPoseEstimator(
         rightEye: Point2D?,
         timestampMs: Long
     ): PoseResult {
+        val previousTimestamp = lastObservationMs
+        if (timestampMs < 0L || (previousTimestamp != null && timestampMs <= previousTimestamp)) {
+            suspendTracking()
+            return PoseResult(null, isHeadDown = false, isNoddingSustained = false, totalNodCount)
+        }
+        if (previousTimestamp != null && timestampMs - previousTimestamp > 600L) nodStartMs = null
+        lastObservationMs = timestampMs
         if (forehead == null || noseTip == null || chin == null ||
             !forehead.isValid() || !noseTip.isValid() || !chin.isValid()
         ) {
-            nodStartMs = null
+            suspendTracking()
             return PoseResult(null, isHeadDown = false, isNoddingSustained = false, totalNodCount)
         }
 
@@ -60,6 +68,7 @@ class HeadPoseEstimator(
         val lowerDist = EyeAspectRatioCalculator.distance(noseTip, chin)
 
         if (lowerDist <= 1e-6 || upperDist <= 1e-6) {
+            suspendTracking()
             return PoseResult(null, isHeadDown = false, isNoddingSustained = false, totalNodCount)
         }
 
@@ -87,6 +96,13 @@ class HeadPoseEstimator(
 
     fun reset() {
         nodStartMs = null
+        lastObservationMs = null
         totalNodCount = 0
+    }
+
+    /** Break a partial nod sequence after missing face data without erasing session totals. */
+    fun suspendTracking() {
+        nodStartMs = null
+        lastObservationMs = null
     }
 }

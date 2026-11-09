@@ -5,6 +5,143 @@ import org.junit.Test
 
 class DrowsinessDetectorTest {
 
+    @Test
+    fun visibleFaceWithoutEarDoesNotBecomeFaceLossOrEyeClosure() {
+        val detector = createDetector()
+        detector.start()
+        detector.observe(0.35, 0L)
+        val unavailable = detector.observe(null, 100L, faceDetected = true)
+
+        assertTrue(unavailable.faceVisible)
+        assertFalse(unavailable.faceLossCritical)
+        assertEquals(0, unavailable.faceLossIncidentCount)
+        assertEquals(DetectionState.MONITORING, unavailable.state)
+        assertEquals(EyeState.UNCERTAIN, unavailable.eyeState)
+        assertNull(unavailable.ear)
+    }
+
+    @Test
+    fun repeatedCriticalPlaybackDoesNotIncrementCriticalIncidentCount() {
+        val detector = createDetector(criticalCooldownMs = 5_000L)
+        detector.start()
+        val times = listOf(0L, 500L, 1_000L, 1_500L, 2_000L, 7_000L)
+        var last: DetectionSnapshot? = null
+        for (time in times) last = detector.observe(0.08, time)
+
+        assertEquals(DetectionState.CRITICAL, last!!.state)
+        assertTrue(last.alarmRequested)
+        assertEquals("Repeat playback preserves the activation-based incident count", 1, detector.criticalDrowsinessIncidentCount)
+        assertEquals("Legacy critical event count still records critical playback", 2, detector.criticalEventsCount)
+    }
+
+    @Test
+    fun faceLossIncidentDoesNotBecomeDrowsinessCriticalIncident() {
+        val detector = createDetector()
+        detector.start()
+        detector.observe(0.35, 0L)
+        detector.observe(0.35, 250L)
+        detector.observe(0.35, 500L)
+        detector.faceLost(600L)
+        val lost = detector.faceLost(2_100L)
+
+        assertTrue(lost.faceLossCritical)
+        assertEquals(1, lost.faceLossIncidentCount)
+        assertEquals(0, detector.criticalDrowsinessIncidentCount)
+        assertEquals(0, detector.criticalEventsCount)
+    }
+
+    @Test
+    fun faceLossAndDrowsinessCriticalConditionsResolveIndependently() {
+        val detector = createDetector()
+        detector.start()
+        for (time in 0L..2_000L step 100L) detector.observe(0.08, time)
+        detector.faceLost(2_100L)
+        val faceLoss = detector.faceLost(3_600L)
+        assertTrue(faceLoss.faceLossCritical)
+        assertTrue(faceLoss.drowsinessCritical)
+
+        detector.observe(0.35, 3_700L)
+        detector.observe(0.35, 3_950L)
+        val recovered = detector.observe(0.35, 4_200L)
+        assertFalse(recovered.faceLossCritical)
+        assertTrue("Drowsiness critical condition remains until eye-based recovery", recovered.drowsinessCritical)
+        assertTrue(recovered.alertActive)
+        assertEquals(1, recovered.faceLossIncidentCount)
+        assertEquals(1, detector.criticalDrowsinessIncidentCount)
+    }
+
+    @Test
+    fun repeatedFaceLossPlaybackUsesCriticalCooldownWithoutNewIncident() {
+        val detector = createDetector(criticalCooldownMs = 5_000L)
+        detector.start()
+        detector.observe(0.35, 0L)
+        detector.observe(0.35, 250L)
+        detector.observe(0.35, 500L)
+        detector.faceLost(600L)
+        val activated = detector.faceLost(2_100L)
+        val repeated = detector.faceLost(7_100L)
+
+        assertTrue(activated.alarmRequested)
+        assertTrue(repeated.alarmRequested)
+        assertEquals(1, repeated.faceLossIncidentCount)
+        assertEquals(0, detector.criticalDrowsinessIncidentCount)
+        assertEquals(0, detector.criticalEventsCount)
+    }
+
+    @Test
+    fun restartResetsIncidentStateAndCounters() {
+        val detector = createDetector()
+        detector.start()
+        detector.observe(0.35, 0L)
+        detector.observe(0.35, 250L)
+        detector.observe(0.35, 500L)
+        detector.faceLost(600L)
+        detector.faceLost(2_100L)
+        assertEquals(1, detector.faceVisibilityTracker.faceLossIncidentCount)
+
+        detector.stop()
+        val restarted = detector.start(nowMs = 3_000L)
+        assertEquals(0, restarted.faceLossIncidentCount)
+        assertEquals(0, restarted.criticalEventsCount)
+        assertEquals(0, restarted.criticalDrowsinessIncidentCount)
+        assertFalse(restarted.faceLossCritical)
+        assertFalse(restarted.alertActive)
+    }
+
+    @Test
+    fun sessionPerclosAverageUsesValidSnapshotsAndDoesNotAdvanceDuringFaceLoss() {
+        val detector = createDetector()
+        detector.start()
+        var timestamp = 0L
+        while (timestamp <= 6_000L) {
+            detector.observe(0.35, timestamp)
+            timestamp += 100L
+        }
+        val averageBeforeLoss = detector.timeWeightedAveragePerclos
+        assertNotNull(averageBeforeLoss)
+        assertEquals(0.0, averageBeforeLoss!!, 0.001)
+
+        detector.faceLost(6_100L)
+        detector.faceLost(7_600L)
+        assertEquals(averageBeforeLoss, detector.timeWeightedAveragePerclos)
+    }
+
+    @Test
+    fun nodEventCountFromVisionReachesScoringEngineOnce() {
+        val detector = createDetector()
+        detector.start()
+        detector.observe(
+            leftEar = 0.35, rightEar = 0.35, faceDetected = true,
+            nodEventCount = 0, timestampMs = 0L
+        )
+        val withNod = detector.observe(
+            leftEar = 0.35, rightEar = 0.35, faceDetected = true,
+            nodEventCount = 1, timestampMs = 100L
+        )
+        assertEquals(1, detector.nodEventCount)
+        assertTrue("Confirmed nod should contribute its event bonus", withNod.drowsinessScore > 0.0)
+    }
+
     private fun createDetector(
         closedThreshold: Double = 0.18,
         openThreshold: Double = 0.22,
@@ -95,13 +232,17 @@ class DrowsinessDetectorTest {
         val detector = createDetector()
         detector.start()
 
-        detector.observe(0.08, 0L)
-        detector.observe(0.08, 1_000L)
-        val criticalSnapshot = detector.observe(0.08, 2_100L) // > 2000ms
+        var criticalSnapshot: DetectionSnapshot? = null
+        var criticalPlaybackRequested = false
+        for (time in 0L..2_100L step 100L) {
+            criticalSnapshot = detector.observe(0.08, time)
+            criticalPlaybackRequested = criticalPlaybackRequested ||
+                (criticalSnapshot.alertLevel == AlertLevel.CRITICAL && criticalSnapshot.alarmRequested)
+        }
 
-        assertEquals(DetectionState.CRITICAL, criticalSnapshot.state)
+        assertEquals(DetectionState.CRITICAL, criticalSnapshot!!.state)
         assertEquals(AlertLevel.CRITICAL, criticalSnapshot.alertLevel)
-        assertTrue(criticalSnapshot.alarmRequested)
+        assertTrue(criticalPlaybackRequested)
         assertEquals(DurationCategory.CRITICAL_SUSTAINED, criticalSnapshot.durationCategory)
     }
 
@@ -136,6 +277,20 @@ class DrowsinessDetectorTest {
     }
 
     @Test
+    fun closureSuspensionFinalizesAtLastObservedClosedFrameAndKeepsHistory() {
+        val tracker = ClosureEpisodeTracker()
+        tracker.update(isClosed = true, timestampMs = 1_000L)
+        tracker.update(isClosed = true, timestampMs = 1_500L)
+        val finalized = tracker.suspendAtLastObservation()
+
+        assertEquals(500L, finalized!!.durationMs)
+        assertEquals(1, tracker.countProlongedClosures(2_000L))
+        val newEpisode = tracker.update(isClosed = true, timestampMs = 10_000L).first
+        assertEquals(0L, newEpisode)
+        assertEquals(1, tracker.getRecentEpisodes(10_000L).size)
+    }
+
+    @Test
     fun repeatedProlongedClosuresAreDetected() {
         val tracker = ClosureEpisodeTracker(recoveryConfirmationMs = 200L, prolongedEpisodeThresholdMs = 500L)
 
@@ -162,18 +317,25 @@ class DrowsinessDetectorTest {
         val detector = createDetector(warningCooldownMs = 2_000L)
         detector.start()
 
-        detector.observe(0.08, 0L)
-        val firstAlert = detector.observe(0.08, 1_100L)
-        assertTrue(firstAlert.alarmRequested)
+        var firstAlert: DetectionSnapshot? = null
+        for (time in 0L..1_100L step 100L) {
+            val current = detector.observe(0.08, time)
+            if (firstAlert == null && current.alarmRequested) firstAlert = current
+        }
+        assertNotNull(firstAlert)
 
         // Next frame shortly after (within cooldown)
-        val cooledSnapshot = detector.observe(0.08, 1_500L)
-        assertEquals(DetectionState.DROWSY, cooledSnapshot.state)
+        var cooledSnapshot: DetectionSnapshot? = null
+        for (time in 1_200L..1_500L step 100L) cooledSnapshot = detector.observe(0.08, time)
+        assertEquals(DetectionState.DROWSY, cooledSnapshot!!.state)
         assertFalse("Should be suppressed by cooldown", cooledSnapshot.alarmRequested)
 
         // Frame after cooldown expires
-        val nextAlert = detector.observe(0.08, 3_200L)
-        assertTrue("Alarm should trigger again after cooldown", nextAlert.alarmRequested)
+        var nextAlertRequested = false
+        for (time in 1_600L..3_200L step 100L) {
+            nextAlertRequested = nextAlertRequested || detector.observe(0.08, time).alarmRequested
+        }
+        assertTrue("Alarm should trigger again after cooldown", nextAlertRequested)
     }
 
     // ─────────────────────────── TEST H: Face temporarily leaves ───────────
@@ -377,7 +539,7 @@ class DrowsinessDetectorTest {
 
     @Test
     fun perclosExcludesFaceLossIntervals() {
-        val calc = PerclosCalculator(windowMs = 10_000L, minimumValidObservationMs = 1_000L)
+        val calc = PerclosCalculator(windowMs = 10_000L, minimumValidObservationMs = 1_000L, maxIntervalMs = 1_000L)
 
         // Record 3 seconds of open-eye observations (face always detected)
         calc.recordObservation(0L, isClosed = false)

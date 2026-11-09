@@ -104,5 +104,12 @@ data class DetectionSnapshot(
     val rightEyeState: EyeState = EyeState.UNCERTAIN,
     val baselineLeftEar: Double? = null,
     val baselineRightEar: Double? = null,
-    val calibrationFailureReason: CalibrationFailureReason = CalibrationFailureReason.NONE
+    val calibrationFailureReason: CalibrationFailureReason = CalibrationFailureReason.NONE,
+    val faceLossCritical: Boolean = false,
+    val faceLossIncidentCount: Int = 0,
+    val alertActive: Boolean = false,
+    val faceVisible: Boolean = false,
+    val drowsinessCritical: Boolean = false,
+    val faceLocked: Boolean = false,
+    val criticalDrowsinessIncidentCount: Int = 0
 )

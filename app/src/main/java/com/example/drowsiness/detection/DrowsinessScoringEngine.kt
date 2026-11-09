@@ -225,4 +225,7 @@ class DrowsinessScoringEngine(
         lastNodBonusAppliedAtCount = 0
         pendingNodBonus = 0.0
     }
+
+    /** Prevent unobserved face-loss time from advancing the open-eye recovery timer. */
+    fun suspendRecovery() { recoveryStartMs = null }
 }

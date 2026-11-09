@@ -22,6 +22,7 @@ import com.example.drowsiness.audio.AlertManager
 import com.example.drowsiness.camera.YuvBitmapConverter
 import com.example.drowsiness.data.DrivingSession
 import com.example.drowsiness.data.SessionRepository
+import com.example.drowsiness.data.SessionFinalizationGuard
 import com.example.drowsiness.detection.AlertLevel
 import com.example.drowsiness.detection.DetectionSnapshot
 import com.example.drowsiness.detection.DetectionState
@@ -79,6 +80,7 @@ class MainActivity : AppCompatActivity() {
     private var timeWarningMs: Long = 0L
     private var timeCriticalMs: Long = 0L
     private var timeFaceLostMs: Long = 0L
+    private val sessionFinalizationGuard = SessionFinalizationGuard()
 
     private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) {
@@ -155,6 +157,7 @@ class MainActivity : AppCompatActivity() {
     private fun startMonitoring() {
         if (monitoring) return
         monitoring = true
+        sessionFinalizationGuard.begin()
         btnStart.isEnabled = false
         btnStop.isEnabled = true
         btnCalibrate.isEnabled = true
@@ -182,11 +185,11 @@ class MainActivity : AppCompatActivity() {
                         val snapshot = detector.start(enableCalibration = true, nowMs = SystemClock.elapsedRealtime())
                         runOnUiThread { render(snapshot) }
                     } catch (e: Exception) {
-                        onPipelineError("Camera initialization failed: ${e.message ?: "unknown error"}")
+                        onPipelineError("Camera initialization failed: ${e.message ?: "unknown error"}", "CAMERA_FAILURE")
                     }
                 }, ContextCompat.getMainExecutor(this))
             } catch (e: Exception) {
-                onPipelineError("Model initialization failed. Check face_landmarker.task: ${e.message ?: ""}")
+                onPipelineError("Model initialization failed. Check face_landmarker.task: ${e.message ?: ""}", "MODEL_FAILURE")
             }
         }
     }
@@ -209,11 +212,13 @@ class MainActivity : AppCompatActivity() {
                 lastInferenceMs = now
 
                 val raw = YuvBitmapConverter.convert(image) ?: return@setAnalyzer
-                val rotated = rotateBitmap(raw, image.imageInfo.rotationDegrees)
-                if (rotated !== raw) raw.recycle()
-
-                val observation = landmarker?.detect(rotated, now)
-                rotated.recycle()
+                val observation = try {
+                    val rotated = rotateBitmap(raw, image.imageInfo.rotationDegrees)
+                    if (rotated !== raw) raw.recycle()
+                    try { landmarker?.detect(rotated, now) } finally { if (!rotated.isRecycled) rotated.recycle() }
+                } finally {
+                    if (!raw.isRecycled) raw.recycle()
+                }
 
                 val snapshot = if (observation == null) {
                     detector.faceLost(now)
@@ -225,6 +230,7 @@ class MainActivity : AppCompatActivity() {
                         mouthAspectRatio = observation.mouthAspectRatio,
                         mouthMetrics = observation.mouthMetrics,
                         headPitchDegrees = observation.headPitchDegrees,
+                        nodEventCount = observation.nodEventCount,
                         timestampMs = now
                     )
                 }
@@ -243,7 +249,7 @@ class MainActivity : AppCompatActivity() {
                 // Escalating Alert Sound & Vibration Execution
                 if (snapshot.alarmRequested) {
                     alertManager.playAlert(snapshot.alertLevel)
-                } else if (snapshot.alertLevel == AlertLevel.NONE) {
+                } else if (!snapshot.alertActive) {
                     alertManager.stop()
                 }
 
@@ -251,7 +257,7 @@ class MainActivity : AppCompatActivity() {
                     if (monitoring) render(snapshot)
                 }
             } catch (e: Exception) {
-                onPipelineError("Frame processing failed: ${e.message ?: "unknown error"}")
+                onPipelineError("Frame processing failed: ${e.message ?: "unknown error"}", "FRAME_PROCESSING_FAILURE")
             } finally {
                 processingFrame.set(false)
                 image.close()
@@ -291,10 +297,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Face Indicator
-        val faceDetected = snapshot.state != DetectionState.FACE_NOT_DETECTED && snapshot.state != DetectionState.STOPPED
-        if (faceDetected) {
+        val faceDetected = snapshot.faceVisible
+        if (faceDetected && snapshot.faceLocked) {
             viewFaceIndicatorDot.backgroundTintList = ContextCompat.getColorStateList(this, R.color.status_normal_green)
             tvFaceStatusText.text = "Face Locked"
+        } else if (faceDetected) {
+            viewFaceIndicatorDot.backgroundTintList = ContextCompat.getColorStateList(this, R.color.status_warning_amber)
+            tvFaceStatusText.text = "Confirming Face…"
         } else {
             viewFaceIndicatorDot.backgroundTintList = ContextCompat.getColorStateList(this, R.color.status_warning_amber)
             tvFaceStatusText.text = "Face Searching…"
@@ -309,19 +318,33 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Alert Banner
-        tvBannerStatus.text = snapshot.statusMessage
-        when (snapshot.state) {
-            DetectionState.CRITICAL -> {
+        tvBannerStatus.text = when {
+            snapshot.faceLossCritical -> DrowsinessDetector.FACE_LOSS_WARNING
+            snapshot.drowsinessCritical -> "CRITICAL: Possible driver drowsiness. Stop safely and take a break."
+            else -> snapshot.statusMessage
+        }
+        when {
+            snapshot.faceLossCritical -> {
+                cardAlertBanner.setCardBackgroundColor(ContextCompat.getColor(this, R.color.status_critical_red_bg))
+                tvBannerAdvice.text = "Check the driver and camera visibility. Face loss does not determine the cause."
+                tvBannerStatus.setTextColor(ContextCompat.getColor(this, R.color.status_critical_red))
+            }
+            snapshot.drowsinessCritical -> {
                 cardAlertBanner.setCardBackgroundColor(ContextCompat.getColor(this, R.color.status_critical_red_bg))
                 tvBannerAdvice.text = "Pull over immediately to a safe location. Do not continue driving."
                 tvBannerStatus.setTextColor(ContextCompat.getColor(this, R.color.status_critical_red))
             }
-            DetectionState.DROWSY -> {
+            snapshot.state == DetectionState.CRITICAL -> {
+                cardAlertBanner.setCardBackgroundColor(ContextCompat.getColor(this, R.color.status_critical_red_bg))
+                tvBannerAdvice.text = "Pull over immediately to a safe location. Do not continue driving."
+                tvBannerStatus.setTextColor(ContextCompat.getColor(this, R.color.status_critical_red))
+            }
+            snapshot.state == DetectionState.DROWSY -> {
                 cardAlertBanner.setCardBackgroundColor(ContextCompat.getColor(this, R.color.status_warning_amber_bg))
                 tvBannerAdvice.text = "Frequent blinks / yawning observed. Stay attentive or plan a rest break."
                 tvBannerStatus.setTextColor(ContextCompat.getColor(this, R.color.status_warning_amber))
             }
-            DetectionState.FACE_NOT_DETECTED -> {
+            snapshot.state == DetectionState.FACE_NOT_DETECTED -> {
                 cardAlertBanner.setCardBackgroundColor(ContextCompat.getColor(this, R.color.status_neutral_grey_bg))
                 tvBannerAdvice.text = "Position device so front camera has an unobstructed view of face."
                 tvBannerStatus.setTextColor(ContextCompat.getColor(this, R.color.status_warning_amber))
@@ -366,17 +389,26 @@ class MainActivity : AppCompatActivity() {
 
         // Drowsiness Score & Event Summary
         tvScoreValue.text = String.format(Locale.US, "%.1f", snapshot.drowsinessScore)
-        tvEventsSummary.text = "Warn: ${snapshot.warningEventsCount} · Crit: ${snapshot.criticalEventsCount} · Yawn: ${snapshot.yawnCount}"
+        tvEventsSummary.text = getString(
+            R.string.dashboard_event_summary,
+            snapshot.warningEventsCount,
+            snapshot.criticalDrowsinessIncidentCount,
+            snapshot.faceLossIncidentCount,
+            snapshot.yawnCount
+        )
     }
 
     private fun showStatusMessage(message: String) {
         tvBannerStatus.text = message
     }
 
-    private fun onPipelineError(message: String) {
+    private fun onPipelineError(message: String, terminationReason: String = "PIPELINE_FAILURE") {
         runOnUiThread {
             showStatusMessage(message)
-            detector.fail()
+            val failureSnapshot = detector.fail()
+            finalizeSession(terminationReason)
+            render(failureSnapshot)
+            alertManager.stop()
             monitoring = false
             btnStart.isEnabled = true
             btnStop.isEnabled = false
@@ -387,6 +419,7 @@ class MainActivity : AppCompatActivity() {
     private fun stopMonitoring() {
         if (!monitoring && analysisExecutor == null) return
         monitoring = false
+        finalizeSession("NORMAL_STOP")
         val snapshot = detector.stop()
         alertManager.stop()
         releasePipeline()
@@ -394,10 +427,14 @@ class MainActivity : AppCompatActivity() {
         btnStart.isEnabled = true
         btnStop.isEnabled = false
 
-        // Record Completed Driving Session
+        render(snapshot)
+    }
+
+    private fun finalizeSession(reason: String) {
         val endTimeMs = System.currentTimeMillis()
         val totalDurationMs = endTimeMs - sessionStartTimeMs
-        if (totalDurationMs > 2_000L) { // Only save sessions longer than 2 seconds
+        sessionFinalizationGuard.finalize(reason, totalDurationMs) { terminationReason ->
+            val weightedPerclos = detector.timeWeightedAveragePerclos
             val session = DrivingSession(
                 startTimeMs = sessionStartTimeMs,
                 endTimeMs = endTimeMs,
@@ -405,17 +442,20 @@ class MainActivity : AppCompatActivity() {
                 warningEventsCount = detector.warningEventsCount,
                 criticalEventsCount = detector.criticalEventsCount,
                 longestClosureMs = detector.episodeTracker.longestClosureMs,
-                averagePerclos = snapshot.perclos ?: 0.0,
+                averagePerclos = null,
                 timeNormalMs = timeNormalMs,
                 timeWarningMs = timeWarningMs,
                 timeCriticalMs = timeCriticalMs,
                 timeFaceLostMs = timeFaceLostMs,
-                yawnCount = detector.yawnTracker.totalYawnCount
+                yawnCount = detector.yawnTracker.totalYawnCount,
+                nodCount = detector.nodEventCount,
+                criticalDrowsinessIncidentCount = detector.criticalDrowsinessIncidentCount,
+                criticalFaceLossIncidentCount = detector.faceVisibilityTracker.faceLossIncidentCount,
+                terminationReason = terminationReason,
+                timeWeightedAveragePerclos = weightedPerclos
             )
             sessionRepository.insertSession(session)
         }
-
-        render(snapshot)
     }
 
     private fun releasePipeline() {
@@ -434,8 +474,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (sessionFinalizationGuard.isActive) {
+            monitoring = false
+            finalizeSession("ACTIVITY_DESTROYED")
+            detector.stop()
+            alertManager.stop()
+        }
         releasePipeline()
         alertManager.close()
+        sessionRepository.close()
         super.onDestroy()
     }
 }

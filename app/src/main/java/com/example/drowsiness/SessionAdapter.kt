@@ -5,6 +5,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
+import com.example.drowsiness.R
 import com.example.drowsiness.data.DrivingSession
 import java.util.Locale
 
@@ -20,6 +21,7 @@ class SessionAdapter(private var sessions: List<DrivingSession> = emptyList()) :
         val tvMaxClosure: TextView = view.findViewById(R.id.tvMaxClosure)
         val tvAvgPerclos: TextView = view.findViewById(R.id.tvAvgPerclos)
         val tvYawnCount: TextView = view.findViewById(R.id.tvYawnCount)
+        val tvAdditionalMetrics: TextView = view.findViewById(R.id.tvAdditionalMetrics)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -36,8 +38,22 @@ class SessionAdapter(private var sessions: List<DrivingSession> = emptyList()) :
         holder.tvWarningCount.text = s.warningEventsCount.toString()
         holder.tvCriticalCount.text = s.criticalEventsCount.toString()
         holder.tvMaxClosure.text = "${s.longestClosureMs} ms"
-        holder.tvAvgPerclos.text = String.format(Locale.getDefault(), "%.1f%%", s.averagePerclos * 100.0)
+        holder.tvAvgPerclos.text = s.timeWeightedAveragePerclos?.let {
+            String.format(Locale.getDefault(), "%.1f%%", it * 100.0)
+        } ?: "—"
         holder.tvYawnCount.text = s.yawnCount.toString()
+        val context = holder.itemView.context
+        holder.tvAdditionalMetrics.text = buildString {
+            append(context.getString(
+                R.string.session_additional_metrics,
+                s.nodCount?.toString() ?: "—",
+                s.criticalDrowsinessIncidentCount?.toString() ?: "—",
+                s.criticalFaceLossIncidentCount?.toString() ?: "—"
+            ))
+            s.terminationReason?.let {
+                append(context.getString(R.string.session_ended_reason, it.replace('_', ' ').lowercase().replaceFirstChar(Char::uppercase)))
+            }
+        }
     }
 
     override fun getItemCount(): Int = sessions.size
