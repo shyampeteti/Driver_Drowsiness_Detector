@@ -10,9 +10,9 @@ import kotlin.math.max
  * do not immediately discard an ongoing closure event.
  */
 class ClosureEpisodeTracker(
-    private val recoveryConfirmationMs: Long = 250L,
-    private val rollingHistoryWindowMs: Long = 45_000L,
-    private val prolongedEpisodeThresholdMs: Long = 500L
+    val recoveryConfirmationMs: Long = 250L,
+    val rollingHistoryWindowMs: Long = 45_000L,
+    val prolongedEpisodeThresholdMs: Long = 500L
 ) {
     private var closureStartMs: Long? = null
     private var lastClosedObservationMs: Long? = null

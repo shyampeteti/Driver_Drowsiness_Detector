@@ -8,15 +8,16 @@ import java.util.ArrayDeque
  * Uses interval-based time calculation rather than frame counts so the result
  * is accurate regardless of variable frame rates or dropped frames.
  *
- * Invalid observations (missing face/landmark loss) must NOT be passed here;
- * the caller is responsible for only recording valid observations.
+ * Invalid observations (missing face, landmark loss, UNCERTAIN states) must NOT be passed here;
+ * only confident observations are recorded.
  */
 class PerclosCalculator(
     val windowMs: Long = 30_000L,
-    private val minimumValidObservationMs: Long = 5_000L
+    val minimumValidObservationMs: Long = 5_000L,
+    val maxIntervalMs: Long = 500L
 ) {
     /**
-     * Each sample records the timestamp and eye state at that point.
+     * Each sample records the timestamp and eye closure state at that point.
      * PERCLOS is computed as the fraction of *time* (not frames) the eyes were closed.
      */
     data class ObservationSample(val timeMs: Long, val isClosed: Boolean)
@@ -24,8 +25,8 @@ class PerclosCalculator(
     private val samples = ArrayDeque<ObservationSample>()
 
     /**
-     * Record a valid observation (face detected, landmarks valid).
-     * Do NOT call this when face is missing — that time is excluded from the denominator.
+     * Record a valid observation (face detected, landmarks valid, state confident).
+     * Do NOT call this when face is missing or state is UNCERTAIN.
      */
     fun recordObservation(timestampMs: Long, isClosed: Boolean) {
         samples.addLast(ObservationSample(timestampMs, isClosed))
@@ -37,7 +38,7 @@ class PerclosCalculator(
      *
      * Uses consecutive sample pairs to compute intervals; the state of the
      * earlier sample determines whether the interval counts as closed.
-     * Returns null until enough time has accumulated in the window.
+     * Returns null until [minimumValidObservationMs] has accumulated in the window.
      */
     fun calculate(timestampMs: Long): Double? {
         prune(timestampMs)
@@ -51,8 +52,8 @@ class PerclosCalculator(
             val current = list[i]
             val next = list[i + 1]
             val intervalMs = next.timeMs - current.timeMs
-            // Clamp unreasonably large gaps (e.g. camera pauses) to 500ms max
-            val clampedIntervalMs = intervalMs.coerceAtMost(500L)
+            // Clamp unreasonably large gaps or negative intervals
+            val clampedIntervalMs = intervalMs.coerceIn(0L, maxIntervalMs)
             if (clampedIntervalMs > 0) {
                 totalTimeMs += clampedIntervalMs
                 if (current.isClosed) {

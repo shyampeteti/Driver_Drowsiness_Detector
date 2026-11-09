@@ -5,6 +5,7 @@ package com.example.drowsiness.detection
  */
 enum class DetectionState {
     INITIALIZING,
+    CALIBRATING,
     MONITORING,
     DROWSY,
     CRITICAL,
@@ -29,6 +30,18 @@ enum class EyeState {
     OPEN,
     CLOSED,
     UNCERTAIN
+}
+
+/**
+ * Reason for calibration failure if calibration did not succeed.
+ */
+enum class CalibrationFailureReason(val description: String) {
+    NONE("Calibration successful or not performed"),
+    INSUFFICIENT_SAMPLES("Insufficient valid eye samples collected"),
+    FACE_NOT_FRONTAL("Driver face was not frontal or stable"),
+    UNSTABLE_MEASUREMENTS("EAR measurements were too noisy or unstable"),
+    INVALID_THRESHOLDS("Derived thresholds failed safety validation"),
+    TIMEOUT("Calibration timed out before acquiring sufficient samples")
 }
 
 /**
@@ -86,5 +99,10 @@ data class DetectionSnapshot(
     val headPitchDegrees: Double? = null,
     val isHeadNodding: Boolean = false,
     val isCalibrating: Boolean = false,
-    val calibrationProgressPercent: Int = 100
+    val calibrationProgressPercent: Int = 100,
+    val leftEyeState: EyeState = EyeState.UNCERTAIN,
+    val rightEyeState: EyeState = EyeState.UNCERTAIN,
+    val baselineLeftEar: Double? = null,
+    val baselineRightEar: Double? = null,
+    val calibrationFailureReason: CalibrationFailureReason = CalibrationFailureReason.NONE
 )
