@@ -41,6 +41,7 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
         val leftEar: Double?,
         val rightEar: Double?,
         val mouthAspectRatio: Double? = null,
+        val mouthMetrics: MouthAspectRatioCalculator.MouthMetrics? = null,
         val headPitchDegrees: Double? = null
     )
 
@@ -63,7 +64,8 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
         }
 
         // Mouth Aspect Ratio (MAR) for Yawning
-        val mar = calculateMar(face, w, h)
+        val mouthMetrics = calculateMouthMetrics(face, w, h)
+        val mar = mouthMetrics?.mar
 
         // Head Pose Pitch for Nodding
         val pitch = estimateHeadPitch(face, w, h, timestampMs)
@@ -74,6 +76,7 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
             leftEar = left,
             rightEar = right,
             mouthAspectRatio = mar,
+            mouthMetrics = mouthMetrics,
             headPitchDegrees = pitch
         )
     }
@@ -92,7 +95,7 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
         return EyeAspectRatioCalculator.calculate(points)
     }
 
-    private fun calculateMar(landmarks: List<NormalizedLandmark>, width: Int, height: Int): Double? {
+    private fun calculateMouthMetrics(landmarks: List<NormalizedLandmark>, width: Int, height: Int): MouthAspectRatioCalculator.MouthMetrics? {
         if (MouthAspectRatioCalculator.ALL_MOUTH_INDICES.any { it !in landmarks.indices }) return null
 
         fun pt(index: Int): Point2D {
@@ -100,7 +103,7 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
             return Point2D(p.x().toDouble() * width, p.y().toDouble() * height)
         }
 
-        return MouthAspectRatioCalculator.calculate(
+        return MouthAspectRatioCalculator.computeMetrics(
             leftCorner = pt(MouthAspectRatioCalculator.CORNER_LEFT),
             rightCorner = pt(MouthAspectRatioCalculator.CORNER_RIGHT),
             upperCenter = pt(MouthAspectRatioCalculator.UPPER_LIP),
@@ -111,6 +114,9 @@ class FaceLandmarkerHelper(context: Context) : AutoCloseable {
             lowerRight = pt(MouthAspectRatioCalculator.LOWER_RIGHT)
         )
     }
+
+    private fun calculateMar(landmarks: List<NormalizedLandmark>, width: Int, height: Int): Double? =
+        calculateMouthMetrics(landmarks, width, height)?.mar
 
     private fun estimateHeadPitch(
         landmarks: List<NormalizedLandmark>,

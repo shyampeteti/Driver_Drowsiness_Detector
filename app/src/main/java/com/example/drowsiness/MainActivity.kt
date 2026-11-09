@@ -223,6 +223,7 @@ class MainActivity : AppCompatActivity() {
                         rightEar = observation.rightEar,
                         faceDetected = observation.faceDetected,
                         mouthAspectRatio = observation.mouthAspectRatio,
+                        mouthMetrics = observation.mouthMetrics,
                         headPitchDegrees = observation.headPitchDegrees,
                         timestampMs = now
                     )
