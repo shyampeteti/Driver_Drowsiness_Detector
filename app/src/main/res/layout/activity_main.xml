@@ -28,18 +28,11 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="DriveSafe AI"
+                    android:text="DriveSafe"
                     android:textColor="@color/text_primary"
                     android:textSize="22sp"
                     android:textStyle="bold" />
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="2dp"
-                    android:text="🛡️ On-Device AI · 100% Private · Zero Cloud"
-                    android:textColor="@color/text_muted"
-                    android:textSize="12sp" />
             </LinearLayout>
 
             <!-- State Badge Pill -->

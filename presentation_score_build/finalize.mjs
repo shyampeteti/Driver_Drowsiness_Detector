@@ -1,0 +1,11 @@
+import fs from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import path from 'node:path';
+const skill='C:/Users/shyam/.codex/plugins/cache/openai-primary-runtime/presentations/26.1105.12137/skills/presentations';
+const {finalizePresentation}=await import(pathToFileURL(skill+'/container_tools/artifact_tool_utils.mjs').href);
+const w='C:/Users/shyam/AndroidStudioProjects/Driver_Drowsiness_Detector';
+const candidate=w+'/presentation_score_build/DriveSafe_Score_Explained.draft.pptx';
+const final=w+'/output/DriveSafe_Driver_Safety_Project_Presentation_Score_Explained.pptx';
+await fs.mkdir(w+'/presentation_score_build/finalizer',{recursive:true});
+const r=await finalizePresentation({workspaceDir:w,candidatePath:candidate,finalPath:final,pythonExecutable:'C:/Program Files/WindowsApps/OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt/dependencies/python/python.exe',integrityValidatorPath:skill+'/container_tools/inspect_presentation_package_integrity.py',layoutValidatorPath:skill+'/container_tools/inspect_presentation_layout_geometry.py',layoutArgs:['--expected-slide-size-emu','12192000,6858000','--validate-bullet-geometry','--validate-heading-fit'],explicitTotalSlideCount:20,fontPolicy:{basis:'user_request',families:['Arial']},verifyArtifactToolImport:true,receiptPath:w+'/presentation_score_build/finalizer/validation.json'});
+console.log(JSON.stringify(r));

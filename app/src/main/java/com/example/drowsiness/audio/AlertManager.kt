@@ -19,11 +19,11 @@ import com.example.drowsiness.detection.AlertLevel
  * vibration feedback, and anti-overlap audio control.
  */
 class AlertManager(private val context: Context) : AutoCloseable {
-    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     val settingsManager = AudioSettingsManager(context)
 
     private var mediaPlayer: MediaPlayer? = null
     private var toneGenerator: ToneGenerator? = null
+    private var isTonePlaying = false
     private var isPlayingCustom = false
     private var activeLevel = AlertLevel.NONE
 
@@ -39,22 +39,18 @@ class AlertManager(private val context: Context) : AutoCloseable {
 
     @Synchronized
     fun playAlert(level: AlertLevel) {
-        if (audioManager.ringerMode == AudioManager.RINGER_MODE_SILENT) {
-            // Still trigger vibration in silent mode for critical alert if enabled
-            if (level == AlertLevel.CRITICAL && settingsManager.isVibrationEnabled) {
-                triggerVibration()
-            }
-            return
-        }
-
         when (level) {
             AlertLevel.CRITICAL -> {
+                if (activeLevel == AlertLevel.CRITICAL && isAudioPlaying()) {
+                    if (settingsManager.isVibrationEnabled) triggerVibration()
+                    return
+                }
                 stopCurrentAudio()
                 activeLevel = AlertLevel.CRITICAL
                 val criticalUri = settingsManager.criticalAudioUri
                 val played = criticalUri?.let { playCustomUri(it) } ?: false
                 if (!played) {
-                    playDefaultTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 1200)
+                    playDefaultTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK)
                 }
                 if (settingsManager.isVibrationEnabled) {
                     triggerVibration()
@@ -63,13 +59,14 @@ class AlertManager(private val context: Context) : AutoCloseable {
             AlertLevel.WARNING -> {
                 // If critical is currently active, do not downgrade to warning audio
                 if (activeLevel == AlertLevel.CRITICAL && isAudioPlaying()) return
+                if (activeLevel == AlertLevel.WARNING && isAudioPlaying()) return
 
                 stopCurrentAudio()
                 activeLevel = AlertLevel.WARNING
                 val warningUri = settingsManager.warningAudioUri
                 val played = warningUri?.let { playCustomUri(it) } ?: false
                 if (!played) {
-                    playDefaultTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 800)
+                    playDefaultTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD)
                 }
             }
             AlertLevel.NONE -> {
@@ -85,13 +82,13 @@ class AlertManager(private val context: Context) : AutoCloseable {
     fun previewAudio(uri: Uri?, onCompletion: (() -> Unit)? = null) {
         stopCurrentAudio()
         if (uri == null) {
-            playDefaultTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 800)
+            playDefaultTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD)
             onCompletion?.invoke()
             return
         }
         val success = playCustomUri(uri, onCompletion)
         if (!success) {
-            playDefaultTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 800)
+            playDefaultTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD)
             onCompletion?.invoke()
         }
     }
@@ -106,6 +103,7 @@ class AlertManager(private val context: Context) : AutoCloseable {
                         .build()
                 )
                 setDataSource(context, uri)
+                isLooping = onCompletion == null
                 setOnCompletionListener { mp ->
                     mp.release()
                     if (mediaPlayer === mp) {
@@ -137,12 +135,12 @@ class AlertManager(private val context: Context) : AutoCloseable {
         }
     }
 
-    private fun playDefaultTone(toneType: Int, durationMs: Int) {
+    private fun playDefaultTone(toneType: Int) {
         try {
             if (toneGenerator == null) {
                 toneGenerator = ToneGenerator(AudioManager.STREAM_ALARM, 95)
             }
-            toneGenerator?.startTone(toneType, durationMs)
+            isTonePlaying = toneGenerator?.startTone(toneType) == true
         } catch (_: Exception) { }
     }
 
@@ -165,7 +163,7 @@ class AlertManager(private val context: Context) : AutoCloseable {
 
     private fun isAudioPlaying(): Boolean {
         return try {
-            mediaPlayer?.isPlaying == true
+            mediaPlayer?.isPlaying == true || isTonePlaying
         } catch (_: Exception) {
             false
         }
@@ -181,6 +179,7 @@ class AlertManager(private val context: Context) : AutoCloseable {
     private fun stopCurrentAudio() {
         try {
             toneGenerator?.stopTone()
+            isTonePlaying = false
         } catch (_: Exception) { }
 
         try {
