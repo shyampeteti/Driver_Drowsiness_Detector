@@ -1,9 +1,29 @@
+# Gradle generated files
 .gradle/
-.kotlin/
-.idea/
 **/build/
+
+# Local machine configuration
 local.properties
+
+# Android Studio
+.idea/
 *.iml
-.externalNativeBuild/
+
+# Kotlin generated files
+.kotlin/
+
+# Native build files
 .cxx/
+.externalNativeBuild/
+
+# Generated packages
+*.apk
+*.aab
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Logs and captures
+*.log
+captures/
