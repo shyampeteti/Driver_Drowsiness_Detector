@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DriveSafe</string>
+    <string name="title_audio_settings">Audio Alert Settings</string>
+    <string name="title_session_history">Driving Session History</string>
+    <string name="dashboard_event_summary">Warn plays: %1$d · Drowsy incidents: %2$d · Face-loss incidents: %3$d · Yawns: %4$d</string>
+    <string name="session_warning_plays">WARN PLAYS</string>
+    <string name="session_critical_plays">CRIT PLAYS</string>
+    <string name="session_time_weighted_perclos">TIME-WEIGHTED PERCLOS</string>
+    <string name="session_additional_metrics">Nods: %1$s · Critical drowsiness incidents: %2$s · Face-loss incidents: %3$s</string>
+    <string name="session_ended_reason"> · Ended: %1$s</string>
+    <string name="rest_recommendation_message">You have experienced several critical drowsiness alerts recently. Consider taking proper rest before your next drive. Avoid driving when sleepy.</string>
+</resources>
