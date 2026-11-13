@@ -27,3 +27,6 @@ Thumbs.db
 # Logs and captures
 *.log
 captures/
+
+# Node dependencies
+**/node_modules/
